@@ -7,7 +7,7 @@ import os
 import subprocess
 import time
 
-from .. import config
+from .. import config, ikev2
 
 log = logging.getLogger("awgr.engine")
 
@@ -54,6 +54,9 @@ class UpRT:
         self.socks_ip: str | None = None        # адрес прокси SOCKS5 (имя разрешает панель)
         self.engine = "go"                      # go (amneziawg-go) | kernel (модуль ядра amneziawg)
         self.reresolved = 0.0                   # когда последний раз заново разбирали имя из Endpoint
+        self.ike: ikev2.Runtime | None = None   # свой демон IKEv2 и его управляющий сокет
+        self.ike_address = ""                   # виртуальный IPv4, выданный сервером IKEv2 (адрес SNAT)
+        self.ike_down_since = self.started      # начало ожидания установленного CHILD_SA
 
 
 class HelperRT:

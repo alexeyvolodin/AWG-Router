@@ -11,6 +11,7 @@ import urllib.parse
 import zlib
 from dataclasses import dataclass, field
 
+from . import ikev2
 from .i18n import Msg, MsgError
 
 # Ключи, которые понимает только awg-quick; в `awg setconf` их передавать нельзя
@@ -74,8 +75,9 @@ class UpstreamConf:
     rekey_after: int = 120
     params: dict = field(default_factory=dict)
     version: str = ""
-    kind: str = "awg"              # "awg" | "socks5"
+    kind: str = "awg"              # "awg" | "socks5" | "ikev2"
     socks: dict = field(default_factory=dict)   # host, port, user, password
+    ikev2: dict = field(default_factory=dict)   # проверенные параметры IKEv2 (ikev2.normalize)
 
 
 SOCKS_MTU = 8500                   # как советует hev-socks5-tunnel: TCP он завершает сам
@@ -258,7 +260,32 @@ def _range_max(v: str, default: int) -> int:
     return max(nums) if nums else default
 
 
+def _parse_ikev2(user_input: str) -> UpstreamConf | None:
+    """Выход IKEv2 хранится как JSON {"kind": "ikev2", ...}: так его отдаёт форма панели и так он лежит в
+    состоянии и резервной копии. None — это не IKEv2; ошибку для такого текста формулирует общий разбор."""
+    if not user_input.lstrip().startswith("{"):
+        return None
+    try:
+        fields = json.loads(user_input)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(fields, dict) or fields.get("kind") != "ikev2":
+        return None
+    try:
+        fields = ikev2.normalize(fields)
+    except ikev2.Ikev2Error as e:
+        raise ConfigError(e.msg) from None
+    host = fields["host"]
+    # порт IKE; Endpoint нужен общему разбору имён (_prefetch_hosts) и карточке выхода
+    endpoint = f"[{host}]:500" if ":" in host else f"{host}:500"
+    return UpstreamConf(raw=json.dumps(fields, ensure_ascii=False, sort_keys=True), setconf="", address="",
+                        mtu=fields["mtu"], endpoint=endpoint, peer_public_key="", kind="ikev2", ikev2=fields)
+
+
 def parse_upstream(user_input: str) -> UpstreamConf:
+    ike = _parse_ikev2(user_input)
+    if ike is not None:
+        return ike
     if is_socks(user_input):
         return parse_socks(user_input)
     text = extract_conf_text(user_input)

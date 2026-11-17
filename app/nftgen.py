@@ -1,7 +1,7 @@
 """Генерация набора правил nftables (чистая функция, легко тестировать).
 
 Логика для пакета, пришедшего от клиента сервера (iif = wg0/awg0):
-  1. локальные/приватные адреса — не трогаем (идут как обычно);
+  1. локальные/приватные адреса — не трогаем (идут как обычно), кроме сетей компании за IKEv2 (_local_guard);
   2. IP клиента ищется в карте clients → цепочка его личной политики,
      иначе — глобальная политика;
   3. политика проверяет правила по порядку (ip daddr @список → выход),
@@ -143,7 +143,9 @@ def mark_for(num: int) -> int:
 
 def _policy_key(policy: dict) -> tuple:
     return (tuple((tuple(l), o) for l, o in policy["rules"]), _okey(policy["default"]),
-            tuple((tuple(l), str(o)) for l, o in policy.get("domain") or ()))
+            tuple((tuple(l), str(o)) for l, o in policy.get("domain") or ()),
+            tuple((tuple(l), _okey(o)) for l, o in policy.get("private_rules") or ()),
+            bool(policy.get("private_domain")), _okey(policy.get("private_default", "direct")))
 
 
 def _set_block(name: str, cidrs: list[str], comment: str = "") -> str:
@@ -165,21 +167,44 @@ DOM_SET = "dom4"     # адреса сайтов из правил по доме
 EXIT_MASK = 0xFFFFFF00
 
 
+def _local_guard(policy: dict, available: set[str], oc) -> list[str]:
+    """Решения для местных и частных адресов внутри политики — когда общего обхода local4 в c_prerouting нет
+    (у какой-то политики есть сеть компании за IKEv2, nftgen.generate: private). Частный адрес из правила на
+    IKEv2 или в блок идёт туда; прочие частные адреса — на private_default (обычно напрямую, как с обходом)."""
+    lines = []
+    for list_ids, target in policy.get("private_rules", []):
+        for lid in list_ids:
+            if lid in available:
+                lines.append(f"\t\tip daddr @local4 ip daddr @l_{lid} goto {oc(target)}")
+    lines.append(f"\t\tip daddr @local4 goto {oc(policy.get('private_default', 'direct'))}")
+    return lines
+
+
 def _policy_chain(name: str, policy: dict, available: set[str], sniff: bool = False,
-                  outs=None, dom: bool = False, quic: bool = False) -> str:
+                  outs=None, dom: bool = False, quic: bool = False, local_guard: bool = False) -> str:
     """Цепочка политики. sniff — у политики есть правила по доменам: её TCP 80/443 идёт в
     sniproxy.py, а QUIC (UDP 443) блокируется — кроме пакетов, которые разобрала по имени очередь
     (quic: метка «пропустить» — дальше обычные правила; остальные решения цепочка c_prerouting
     принимает раньше), и браузер переходит на обычный HTTPS. dom — только к адресам из набора
     DOM_SET (режим «фильтр по DNS»): остальное идёт ядром, и HTTP/3 к ним работает.
-    outs — свои цепочки выходов (для q_* в hook output)."""
+    outs — свои цепочки выходов (для q_* в hook output).
+    local_guard — решения для частных адресов (_local_guard) в начале цепочки. Перехват посредником у политики с
+    правилами по доменам на IKEv2 (private_domain) стоит раньше них: корпоративный сайт часто на частном адресе."""
     oc = outs or out_chain
     lines = [f"\tchain {name} {{"]
+    sniff_lines = []
     if sniff:
         pre = f"ip daddr @{DOM_SET} " if dom else ""
         skip = f"meta mark != {config.QUIC_PASS_MARK:#x} " if quic else ""
-        lines.append(f"\t\t{pre}udp dport 443 {skip}goto {oc('block')}")
-        lines.append(f"\t\t{pre}tcp dport {{ 80, 443 }} meta mark set {config.SNIFF_MARK:#x} accept")
+        sniff_lines = [f"\t\t{pre}udp dport 443 {skip}goto {oc('block')}",
+                       f"\t\t{pre}tcp dport {{ 80, 443 }} meta mark set {config.SNIFF_MARK:#x} accept"]
+    private_sniff = bool(policy.get("private_domain"))
+    if private_sniff:
+        lines += sniff_lines
+    if local_guard:
+        lines += _local_guard(policy, available, oc)
+    if not private_sniff:
+        lines += sniff_lines
     for list_ids, out in policy["rules"]:
         for lid in list_ids:
             if lid in available:
@@ -198,13 +223,24 @@ def layout(global_policy: dict, client_policies: dict[str, dict], up_nums: set[i
     def norm(policy: dict) -> dict:
         # выход на несуществующий туннель → блок (безопасный вариант)
         fix = lambda o: o if o in ("direct", "block") or o in up_nums else "block"
+
+        def fix_default(o):
+            """Выход по умолчанию: Sticky на выход вне балансировки — обычный (цепочки ob_u* нет)."""
+            o = fix(o)
+            return int(o) if isinstance(o, Sticky) and int(o) not in balance else o
         rules = [(l, fix(o)) for l, o in policy["rules"]]
-        default = fix(policy["default"])
-        if isinstance(default, Sticky) and int(default) not in balance:
-            default = int(default)
+        default = fix_default(policy["default"])
         while rules and rules[-1][1] == default:  # хвостовые правила ничего не меняют
             rules.pop()
-        return {"rules": rules, "default": default, "domain": list(policy.get("domain") or ())}
+        result = {"rules": rules, "default": default, "domain": list(policy.get("domain") or ())}
+        # частные решения для IKEv2 (engine._policies): тот же «блок вместо несуществующего туннеля»
+        if policy.get("private_rules"):
+            result["private_rules"] = [(l, fix(o)) for l, o in policy["private_rules"]]
+        if policy.get("private_domain"):
+            result["private_domain"] = True
+        if "private_default" in policy:
+            result["private_default"] = fix_default(policy["private_default"])
+        return result
 
     gp = norm(global_policy)
     chains: dict[tuple, str] = {_policy_key(gp): "p_global"}
@@ -261,8 +297,13 @@ def generate(wg_iface: str, lists: dict[str, list[str]], upstreams: list[dict],
     policies, client_map = layout(global_policy, client_policies, up_nums, balance)
     marks = sniff_marks(policies, slots) if sniff_port else {}
 
-    used_lists = sorted({lid for p in policies.values() for l, _ in p["rules"] for lid in l})
+    used_lists = sorted({lid for p in policies.values() for l, _ in [*p["rules"], *p.get("private_rules", [])]
+                         for lid in l})
     available = {lid for lid in used_lists if lists.get(lid)}
+    # у какой-то политики есть сеть компании за IKEv2: общего обхода частных адресов в c_prerouting нет, каждая
+    # политика решает о них сама (_local_guard), иначе частная сеть компании ушла бы напрямую
+    private = any(p.get("private_domain") or p.get("private_rules") or "private_default" in p
+                  for p in policies.values())
 
     dom_filter = bool(dom_filter and marks)
     quic = bool(quic and marks)
@@ -290,19 +331,22 @@ def generate(wg_iface: str, lists: dict[str, list[str]], upstreams: list[dict],
                  f"ct mark set {config.QUIC_PASS_MARK | config.QUIC_CT_BIT:#x}\n"
                  f"\t\tudp dport 443 meta mark != 0x0 meta mark != {config.QUIC_PASS_MARK:#x} "
                  f"ct mark set meta mark | {config.QUIC_CT_BIT:#x} accept\n") if quic else ""
+    local_bypass = "" if private else "\t\tip daddr @local4 return\n"
     out.append(f"""\tchain c_prerouting {{
 \t\ttype filter hook prerouting priority mangle; policy accept;
 \t\tiifname != "{wg_iface}" return
-\t\tip daddr @local4 return
-{quic_line}\t\tip saddr vmap @clients
+{local_bypass}{quic_line}\t\tip saddr vmap @clients
 \t\tgoto p_global
 \t}}""")
 
     for name in sorted(policies, key=lambda n: (n != "p_global", n)):
         if strict and not sniff_port and policies[name].get("domain"):
-            out.append(f"\tchain {name} {{\n\t\tgoto o_block\n\t}}")
+            # блок не касается местных сетей: без общего обхода их решения — в самой цепочке
+            guard = "\n".join(_local_guard(policies[name], available, out_chain)) + "\n" if private else ""
+            out.append(f"\tchain {name} {{\n{guard}\t\tgoto o_block\n\t}}")
             continue
-        out.append(_policy_chain(name, policies[name], available, name in marks, dom=dom_filter, quic=quic))
+        out.append(_policy_chain(name, policies[name], available, name in marks, dom=dom_filter, quic=quic,
+                                 local_guard=private))
 
     out.append("\tchain o_direct {\n\t\taccept\n\t}")
     out.append(f"\tchain o_block {{\n\t\tmeta mark set {config.MARK_BLOCK:#x} accept\n\t}}")
@@ -380,8 +424,8 @@ def generate(wg_iface: str, lists: dict[str, list[str]], upstreams: list[dict],
 \t\tmeta mark vmap {{ {vm} }}
 \t}}""")
         for n in marks:
-            out.append(_policy_chain("q_" + n, policies[n], available, False, oq).replace(
-                f"\tchain q_{n} {{", f"\tchain q_{n} {{\n\t\tip daddr @local4 goto oq_direct", 1))
+            # местные адреса — первыми: напрямую или, для сети компании за IKEv2, по её правилам
+            out.append(_policy_chain("q_" + n, policies[n], available, False, oq, local_guard=True))
         out.append("\tchain oq_direct {\n\t\tmeta mark set 0x0 accept\n\t}")
         out.append("\tchain oq_block {\n\t\treject with tcp reset\n\t}")
         for u in sorted(upstreams, key=lambda x: x["num"]):
@@ -402,7 +446,13 @@ def generate(wg_iface: str, lists: dict[str, list[str]], upstreams: list[dict],
     # мимо туннеля — в никуда; метка политики sniproxy.py, которой нет в c_output (его настройки и nftables на миг
     # разошлись), — тоже, а не основная таблица. В hook postrouting, а не output: в output имя интерфейса —
     # прежний путь, до того как c_output (type route) сменил метку и маршрут; reject там нельзя — только drop
+    # Выход IKEv2 (XFRM): перед шифрованием ядро ещё раз проводит пакет через postrouting — с меткой выхода, но
+    # уже с внешним интерфейсом маршрута к серверу IKEv2. Пакет с маршрутом IPsec уйдёт в туннель, это не утечка;
+    # пропуск — только для меток выходов IKEv2
+    ipsec = "".join(f"\t\tmeta mark {mark_for(u['num']):#x} rt ipsec exists accept\n"
+                    for u in sorted(upstreams, key=lambda x: x["num"]) if u.get("ipsec"))
     out.append("\tchain c_guard_post {\n\t\ttype filter hook postrouting priority filter; policy accept;\n"
+               f"{ipsec}"
                f'\t\tmeta mark & {EXIT_MASK:#x} == {config.MARK_BASE:#x} oifname != "lo" '
                f'oifname != "{config.IFACE_PREFIX}*" drop\n'
                f"\t\tmeta mark & {EXIT_MASK:#x} == {config.SNIFF_OUT_BASE:#x} drop\n\t}}")

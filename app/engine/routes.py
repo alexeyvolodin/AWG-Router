@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 
-from .. import config, nftgen, shaping, system
+from .. import awgconf, config, nftgen, shaping, system
 from ..i18n import Msg
 from ..store import Store
 
@@ -101,19 +101,40 @@ class RoutesMixin:
     def domain_lists(st: dict) -> set[str]:
         return {l["id"] for l in st["lists"] if l.get("kind") == "domains"}
 
+    def _ike_outs(self, st: dict) -> set[str]:
+        """Выходы IKEv2 ('up:<id>'). Выход с повреждённым конфигом пропускается: он остаётся в состоянии
+        ошибки, а остальные правила собираются как обычно."""
+        outs = set()
+        for u in st["upstreams"]:
+            try:
+                if self.parsed(u).kind == "ikev2":
+                    outs.add("up:" + u["id"])
+            except awgconf.ConfigError:
+                continue
+        return outs
+
     def _policies(self, st: dict) -> tuple[dict, dict]:
         """Общая и личные политики для nftables и sniproxy.py: правила по адресам — с выходом
-        после резолва; правила со списками доменов — отдельно (их выход резолвит sniproxy-конфиг)."""
+        после резолва; правила со списками доменов — отдельно (их выход резолвит sniproxy-конфиг).
+        Сети компании за IKEv2 часто частные, а частные адреса обычно идут напрямую мимо всех правил. Поэтому у
+        политики с правилами или выходом по умолчанию на IKEv2 есть частные решения (nftgen, local_guard):
+        private_rules — правила по адресам, где частные адреса идут только на IKEv2 или в блок, остальные напрямую;
+        private_domain — частные адреса тоже идут к посреднику; private_default — куда идут прочие частные адреса."""
         dl = self.domain_lists(st)
+        ike_outs = self._ike_outs(st)
+        private_outs = ike_outs | {"block"}      # куда правило может увести частный адрес; остальные — напрямую
 
         def conv(pol: dict, pk: str | None) -> dict:
-            ip_rules, dom = [], []
+            ip_rules, dom, private_rules = [], [], []
             for r in pol["rules"]:
                 if any(lid in dl for lid in r["lists"]):
                     dom.append(([lid for lid in r["lists"] if lid in dl], r["outbound"]))
                 else:
-                    ip_rules.append((r["lists"], self.resolve(r["outbound"], st)))
-            default = self.resolve(self.default_out(st, pk, pol), st)
+                    out = self.resolve(r["outbound"], st)
+                    ip_rules.append((r["lists"], out))
+                    private_rules.append((r["lists"], out if r["outbound"] in private_outs else "direct"))
+            wanted = self.default_out(st, pk, pol)
+            default = self.resolve(wanted, st)
             # правила по доменам, которые ведут туда же, куда всё остальное, ничего не меняют —
             # но включили бы перехват всего HTTPS/HTTP клиента посредником. Только без правил по
             # адресам: домен проверяется раньше них и мог бы увести сайт мимо правила по адресу
@@ -122,7 +143,16 @@ class RoutesMixin:
                 dom = []
             if pol.get("balanced") and isinstance(default, int) and default in self.bal_nums:
                 default = nftgen.Sticky(default)     # открытые соединения не переезжают
-            return {"rules": ip_rules, "default": default, "domain": dom}
+            result = {"rules": ip_rules, "default": default, "domain": dom}
+            ike_default = wanted in ike_outs
+            if ike_default or any(r["outbound"] in ike_outs and not any(lid in dl for lid in r["lists"])
+                                  for r in pol["rules"]):
+                result["private_rules"] = private_rules
+            if any(o in ike_outs for _, o in dom):
+                result["private_domain"] = True
+            if ike_default:
+                result["private_default"] = default
+            return result
 
         gp = conv(self.policy_for(st, None), None)
         cps = {}
@@ -144,8 +174,10 @@ class RoutesMixin:
                     continue
                 # QUIC через SOCKS5 — только с галочкой: многие прокси без UDP, и браузер ждал бы
                 # QUIC впустую, прежде чем перейти на TCP
-                ups.append({"num": u["num"], "snat": pc.address, "mtu": pc.mtu,
-                            "no_quic": pc.kind == "socks5" and not u.get("quic")})
+                # адрес IKEv2 выдаёт сервер при подключении (CHILD_SA), в конфиге его нет
+                snat = self.rt[u["id"]].ike_address if pc.kind == "ikev2" else pc.address
+                ups.append({"num": u["num"], "snat": snat, "mtu": pc.mtu,
+                            "no_quic": pc.kind == "socks5" and not u.get("quic"), "ipsec": pc.kind == "ikev2"})
         return ups
 
     def build_ruleset(self, t: system.Target, st: dict, sniff_port: int | None = None, quic: bool = False,

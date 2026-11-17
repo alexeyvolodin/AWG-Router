@@ -119,14 +119,21 @@ class DiagMixin:
         dl = self.domain_lists(st)
         sni_on = bool(self.sni_state and self.sni_state.get("state") == "on")
         steps = []
-        for net in nftgen.LOCAL_NETS:
-            if ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(net):
-                return {"result": "direct", "effective": "direct",
-                        "steps": [Msg("tr.local", ip=ip, net=net)]}
+        local_net = next((net for net in nftgen.LOCAL_NETS
+                          if ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(net)), None)
         pol = self.policy_for(st, pk)
+        # частный адрес идёт напрямую, кроме сети компании за IKEv2 — так же, как в nftgen (_local_guard)
+        ike_outs = self._ike_outs(st)
+        private_domains = any(r["outbound"] in ike_outs and any(lid in dl for lid in r["lists"])
+                              for r in pol["rules"])
+        private_networks = self.default_out(st, pk, pol) in ike_outs or any(
+            r["outbound"] in ike_outs and not any(lid in dl for lid in r["lists"]) for r in pol["rules"])
+        if local_net and not private_domains and not private_networks:
+            return {"result": "direct", "effective": "direct", "steps": [Msg("tr.local", ip=ip, net=local_net)]}
         steps.append(Msg("tr.client_rules" if pk and st["clients"].get(pk, {}).get("rules_mode")
                          == "custom" else "tr.global_rules"))
-        for r in pol["rules"] if name and sni_on else []:
+        domain_route = bool(name) and (not local_net or private_domains)
+        for r in pol["rules"] if domain_route and sni_on else []:
             for lid in r["lists"]:
                 dom = self.domain_matcher.match(lid, name) if lid in dl else None
                 if dom:
@@ -134,17 +141,20 @@ class DiagMixin:
                     eff = self.resolve(r["outbound"], st)
                     return {"result": r["outbound"], "effective": eff, "steps": steps,
                             "rule": r.get("comment") or r["id"], "domain": dom}
-        for r in pol["rules"]:
+        for r in pol["rules"] if not local_net or private_networks else []:
             for lid in r["lists"]:
                 if lid in dl:
                     continue
                 hit = self.matcher.contains(lid, ip)
                 if hit:
                     steps.append(Msg("tr.match", list=lid, net=hit))
-                    eff = self.resolve(r["outbound"], st)
-                    return {"result": r["outbound"], "effective": eff, "steps": steps,
+                    # частный адрес по правилу не на IKEv2 и не в блок идёт напрямую
+                    out = r["outbound"] if not local_net or r["outbound"] in ike_outs | {"block"} else "direct"
+                    return {"result": out, "effective": self.resolve(out, st), "steps": steps,
                             "rule": r.get("comment") or r["id"]}
         out = self.default_out(st, pk, pol)
+        if local_net and out not in ike_outs:
+            return {"result": "direct", "effective": "direct", "steps": [*steps, Msg("tr.local", ip=ip, net=local_net)]}
         if out != pol["default"]:
             steps.append(Msg("tr.balance" if pk else "tr.balance_new",
                              exit=(Store.upstream(st, out[3:]) or {}).get("name", out)))

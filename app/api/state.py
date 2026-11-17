@@ -23,7 +23,9 @@ def _upstream_view(st: dict, u: dict, bal_members: set | None = None, bal_counts
         bal_counts = engine.balancer.counts()
     try:
         pc = engine.parsed(u)
-        info = {"endpoint": pc.endpoint, "address": pc.address, "mtu": pc.mtu,
+        # адрес IKEv2 выдаёт сервер при подключении: в конфиге его нет, он — в здоровье выхода
+        address = engine.health.get(u["id"], {}).get("address", "") if pc.kind == "ikev2" else pc.address
+        info = {"endpoint": pc.endpoint, "address": address, "mtu": pc.mtu,
                 "version": pc.version, "kind": pc.kind, "own_list": u.get("own_list"),
                 "socks_user": pc.socks.get("user") if pc.kind == "socks5" else None,
                 "quic": bool(u.get("quic")) if pc.kind == "socks5" else True,

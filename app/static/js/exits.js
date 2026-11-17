@@ -1,4 +1,4 @@
-// Вкладка «Выходы»: карточки выходов и окно выхода (AmneziaWG и SOCKS5).
+// Вкладка «Выходы»: карточки выходов и окно выхода (AmneziaWG, SOCKS5 и IKEv2).
 "use strict";
 
 /* ================================================================ выходы */
@@ -6,11 +6,12 @@ function viewExits() {
   const cards = S.upstreams.map((u) => {
     const h = u.health || {};
     let st = stateBadge(u);
-    if (u.enabled && h.healthy && !quotaSwitched(u)) st = `<span class="state"><span class="dot ok"></span>${esc(u.kind === "socks5" ? t("ex.working_socks", { ms: h.latency_ms ?? "?" }) : t("ex.working", { ago: fmtAge(h.handshake_age) }))}</span>`;
-    else if (u.enabled && u.kind === "socks5" && h.error && h.state !== "error") st += ` <span class="small warn-text">${esc(tm(h.error))}</span>`;
+    if (u.enabled && h.healthy && !quotaSwitched(u)) st = `<span class="state"><span class="dot ok"></span>${esc(u.kind === "ikev2" ? t("ike.connected") : u.kind === "socks5" ? t("ex.working_socks", { ms: h.latency_ms ?? "?" }) : t("ex.working", { ago: fmtAge(h.handshake_age) }))}</span>`;
+    // у SOCKS5 и IKEv2 причина видна, пока панель ещё повторяет попытки, а не только после их остановки
+    else if (u.enabled && (u.kind === "socks5" || u.kind === "ikev2") && h.error && h.state !== "error") st += ` <span class="small warn-text">${esc(tm(h.error))}</span>`;
     else if (u.enabled && h.state === "error") st = `<span class="state"><span class="dot bad"></span>${esc(tm(h.error) || t("st.error"))}</span>`;
     else if (u.enabled && h.handshake_age) st += ` <span class="muted small">${esc(t("ex.last_handshake", { ago: fmtAge(h.handshake_age) }))}</span>`;
-    const ver = u.kind === "socks5" ? "SOCKS5" : u.version ? `AWG ${u.version}` : u.config_error ? "" : "WireGuard";
+    const ver = u.kind === "ikev2" ? "IKEv2" : u.kind === "socks5" ? "SOCKS5" : u.version ? `AWG ${u.version}` : u.config_error ? "" : "WireGuard";
     return `
     <div class="panel exit ${u.enabled ? "" : "disabled-exit"}" style="--c:${lineVar(u)}">
       <div class="exit-bar"></div>
@@ -146,8 +147,11 @@ async function editUpstream(id) {
     try { conf = (await api("GET", `upstreams/${id}/config`)).config; } catch (e) { toast(e.message, true); return; }
     if (u.own_list && listObj(u.own_list)) { try { ownText = (await api("GET", "lists/" + u.own_list)).source || ""; } catch (e) { /* пусто */ } }
   }
-  let kind = u ? (u.kind === "socks5" ? "socks5" : "awg") : "awg";
-  const buf = { awg: kind === "awg" ? conf : "", socks5: kind === "socks5" ? conf : "" };
+  let kind = u && ["socks5", "ikev2"].includes(u.kind) ? u.kind : "awg";
+  // у IKEv2 текстового поля конфига нет (свои поля), но окно меняет тип и через общий буфер
+  const buf = { awg: kind === "awg" ? conf : "", socks5: kind === "socks5" ? conf : "", ikev2: "" };
+  // конфиг IKEv2 — JSON с проверенными полями (awgconf): форма показывает их по отдельности
+  const ike = kind === "ikev2" ? JSON.parse(conf) : {};
   // что сейчас ведёт на этот выход в общих правилах
   const routed = new Set(out ? S.routing.rules.filter((r) => r.outbound === out && r.enabled !== false).flatMap((r) => r.lists) : []);
   const dlists = S.lists.filter((l) => l.kind === "domains" && l.id !== (u && u.own_list));
@@ -156,7 +160,7 @@ async function editUpstream(id) {
   const group = (title, ls) => ls.length ? `<div class="field"><span>${esc(title)}</span><div class="check-cols">${ls.map(box).join("")}</div></div>` : "";
   openModal(u ? t("ex.modal_title", { name: u.name }) : t("ex.new"), `
     <div class="field"><span>${esc(t("ex.kind"))}</span>
-      <div class="seg" id="u-kind"><button type="button" data-v="awg">AmneziaWG</button><button type="button" data-v="socks5">SOCKS5</button></div>
+      <div class="seg" id="u-kind"><button type="button" data-v="awg">AmneziaWG</button><button type="button" data-v="socks5">SOCKS5</button><button type="button" data-v="ikev2">IKEv2</button></div>
       ${u ? `<span class="hint">${esc(t("ex.kind_locked"))}</span>` : ""}</div>
     <label class="field"><span>${esc(t("ex.name"))}</span><input type="text" data-field="name" id="u-name" maxlength="40" value="${esc(u ? u.name : "")}" placeholder="${esc(t("ex.name_ph"))}"></label>
     <div id="u-sf">
@@ -171,7 +175,21 @@ async function editUpstream(id) {
       <div class="field"><label class="check"><input type="checkbox" data-field="quic" id="u-quic" ${u && u.quic === true && u.kind === "socks5" ? "checked" : ""}><span>${esc(t("ex.socks_quic"))}</span></label>
         <span class="hint">${esc(t("ex.socks_quic_hint"))}</span></div>
     </div>
-    <label class="field"><span id="u-conf-l"></span>
+    <div id="u-ike">
+      <label class="field"><span>${esc(t("ike.host"))}</span><input type="text" data-field="config" id="u-ih" dir="ltr" spellcheck="false" autocomplete="off" value="${esc(ike.host || "")}" placeholder="vpn.example.com"></label>
+      <div class="row2">
+        <label class="field"><span>${esc(t("ike.remote_id"))}</span><input type="text" data-field="config" id="u-ir" dir="ltr" spellcheck="false" autocomplete="off" value="${esc(ike.remote_id || "")}" placeholder="vpn.example.com"></label>
+        <label class="field"><span>${esc(t("ike.local_id"))}</span><input type="text" data-field="config" id="u-il" dir="ltr" spellcheck="false" autocomplete="off" value="${esc(ike.local_id || "")}"></label>
+      </div>
+      <div class="row2">
+        <label class="field"><span>${esc(t("ex.socks_user"))}</span><input type="text" data-field="config" id="u-iu" dir="ltr" spellcheck="false" autocomplete="off" value="${esc(ike.user || "")}"></label>
+        <label class="field"><span>${esc(t("ex.socks_pass"))}</span><input type="password" data-field="config" id="u-iw" dir="ltr" autocomplete="new-password" value="${esc(ike.password || "")}"></label>
+      </div>
+      <label class="field"><span>${esc(t("ike.ca"))}</span><textarea data-field="config" id="u-ic" class="short" dir="ltr" spellcheck="false">${esc(ike.ca || "")}</textarea><span class="hint">${esc(t("ike.cert_hint"))}</span></label>
+      <label class="field"><span>MTU</span><input type="number" data-field="config" id="u-im" min="1100" max="1500" value="${esc(ike.mtu || 1280)}"></label>
+      <p class="small muted">${esc(t("ike.sites_hint"))}</p>
+    </div>
+    <label class="field" id="u-configf"><span id="u-conf-l"></span>
       <textarea data-field="config" id="u-conf" dir="ltr" spellcheck="false"></textarea>
       <span class="hint" id="u-conf-h"></span>
     </label>
@@ -214,15 +232,18 @@ async function editUpstream(id) {
     if (f) for (const k in F) F[k].value = f[k];
   };
   const draw = () => {
-    const socks = kind === "socks5";
+    const socks = kind === "socks5", ikev2 = kind === "ikev2";
     $$("#u-kind button").forEach((b) => {
       b.setAttribute("aria-pressed", b.dataset.v === kind);
       b.disabled = !!u && b.dataset.v !== kind;          // тип существующего выхода не меняется
     });
     $("#u-sf").hidden = !socks;
-    $("#u-filef").hidden = socks;
-    // новый выход AWG, пока ничего не выбрано, становится основным, если основного ещё нет (как раньше)
-    if (!u && !routeTouched) $("#u-rdef").checked = !socks && S.routing.default === "direct";
+    $("#u-ike").hidden = !ikev2;
+    $("#u-configf").hidden = ikev2;
+    $("#u-filef").hidden = socks || ikev2;
+    // новый выход AWG, пока ничего не выбрано, становится основным, если основного ещё нет (как раньше);
+    // корпоративный IKEv2 — нет: через него идут только выбранные сети и сайты
+    if (!u && !routeTouched) $("#u-rdef").checked = kind === "awg" && S.routing.default === "direct";
     $("#u-conf-l").textContent = t(socks ? "ex.socks_line" : "ex.config");
     $("#u-conf-h").textContent = socks ? t("ex.socks_line_hint") : t("ex.config_hint");
     ta.placeholder = socks ? "socks5://login:password@203.0.113.20:1080" : t("ex.config_ph");
@@ -232,7 +253,11 @@ async function editUpstream(id) {
   };
   $$("#u-kind button").forEach((b) => b.onclick = () => {
     if (b.disabled || b.dataset.v === kind) return;
-    buf[kind] = ta.value; kind = b.dataset.v; draw();
+    const was = kind;
+    buf[kind] = ta.value; kind = b.dataset.v;
+    // без сессии IKEv2 корпоративный трафик не должен уходить в интернет напрямую; уход с IKEv2 — снова «напрямую»
+    if (!u && (kind === "ikev2" || was === "ikev2")) $("#u-fb").value = kind === "ikev2" ? "block" : "direct";
+    draw();
   });
   Object.values(F).forEach((el) => el.oninput = () => {
     if (el === F.port) el.value = el.value.replace(/\D/g, "");
@@ -254,7 +279,10 @@ async function editUpstream(id) {
     const body = { name: $("#u-name").value.trim(), fallback: $("#u-fb").value,
       quota_gb: $("#u-quota").value.trim(), quota_action: $("#u-qa").value,
       rate_down: $("#u-rd").value.trim() || null, rate_up: $("#u-ru").value.trim() || null };
-    const c = ta.value.trim();
+    const c = kind === "ikev2" ? JSON.stringify({ kind: "ikev2", host: $("#u-ih").value.trim(),
+      remote_id: $("#u-ir").value.trim(), local_id: $("#u-il").value.trim(),
+      user: $("#u-iu").value, password: $("#u-iw").value, ca: $("#u-ic").value.trim(),
+      mtu: +$("#u-im").value || 1280 }) : ta.value.trim();
     if (!u || c !== conf.trim()) body.config = c;
     if (kind === "socks5") body.quic = $("#u-quic").checked;
     if (routeTouched || !u) {

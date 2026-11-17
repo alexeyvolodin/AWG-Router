@@ -31,7 +31,7 @@ function viewOverview() {
     const na = assigned["up:" + u.id] || 0;
     const meta = [
       `<span><bdi>${esc(u.endpoint || "")}</bdi></span>`,
-      h.healthy ? `<span>${esc(u.kind === "socks5" ? t("ov.socks_ms", { ms: h.latency_ms ?? "?" }) : t("ov.handshake", { ago: fmtAge(h.handshake_age) }))}</span>` : "",
+      h.healthy ? `<span>${esc(u.kind === "ikev2" ? t("ike.connected") : u.kind === "socks5" ? t("ov.socks_ms", { ms: h.latency_ms ?? "?" }) : t("ov.handshake", { ago: fmtAge(h.handshake_age) }))}</span>` : "",
       acctOn() ? `<span>${esc(t("ex.month"))} ${arrows(u.traffic)}</span>`
         : h.rx != null && u.enabled ? `<span>↓ ${esc(fmtBytes(h.rx))} ↑ ${esc(fmtBytes(h.tx))}</span>` : "",
       acctOn() && !dead && (u.rate_down || u.rate_up || Math.max(...(u.speed || [0])) >= 12500) ? `<span>${speedHtml(u)}</span>` : "",

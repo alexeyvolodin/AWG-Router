@@ -3252,6 +3252,60 @@ Object.assign(I18N.fa, {
   "sni.restart_wait": "پردازشگر قانون‌های دامنه متوقف شد؛ تلاش بعدی برای راه‌اندازی تا {s} ثانیهٔ دیگر",
 });
 
+/* IKEv2: сертификат проверяется независимо от парольной аутентификации клиента. */
+Object.assign(I18N.ru, {
+  "ike.host": "Сервер IKEv2", "ike.remote_id": "Удалённый ID (пусто: имя сервера)",
+  "ike.local_id": "Локальный ID (пусто: логин)", "ike.ca": "Сертификат CA компании (PEM, необязательно)",
+  "ike.cert_hint": "Без отдельного CA используются доверенные сертификаты образа панели. Имя сервера проверяется всегда.",
+  "ike.sites_hint": "Сайты компании должны находиться через обычный DNS клиента: внутренние имена компании через IKEv2 не разрешаются. Для выбранных сайтов добавьте домены ниже; остальные сайты сохранят текущий маршрут.",
+  "ike.connected": "сессия IKEv2 установлена", "ike.invalid": "Неверное поле IKEv2: {field}",
+  "ike.start_failed": "Не запустился клиент IKEv2; проверьте журнал выхода",
+  "ike.already_running": "В каталоге выхода уже работает клиент IKEv2; остановите прежний процесс перед повторным запуском",
+  "ike.load_failed": "Не удалось загрузить параметры IKEv2; проверьте реквизиты и сертификат CA",
+  "ike.xfrm_failed": "Не удалось создать XFRM-интерфейс; требуется поддержка XFRM в ядре Linux",
+  "ike.check_failed": "Не удалось проверить состояние IKEv2", "ike.connect_failed": "Не удалось установить IKEv2; проверьте доступность сервера, реквизиты и сертификат",
+  "ike.untrusted_server": "Сертификат сервера IKEv2 не прошёл проверку: он выдан не на удалённый ID или не сводится к доверенному CA. Проверьте удалённый ID; если сервер не присылает цепочку целиком, укажите в настройках выхода сертификат CA сервера",
+});
+Object.assign(I18N.en, {
+  "ike.host": "IKEv2 server", "ike.remote_id": "Remote ID (empty: server name)",
+  "ike.local_id": "Local ID (empty: username)", "ike.ca": "Company CA certificate (PEM, optional)",
+  "ike.cert_hint": "Without a custom CA, the panel image's trusted certificates are used. The server identity is always verified.",
+  "ike.sites_hint": "Company sites must resolve through the client's regular DNS: internal company names are not resolved through IKEv2. Add selected site domains below; other sites keep their current route.",
+  "ike.connected": "IKEv2 session established", "ike.invalid": "Invalid IKEv2 field: {field}",
+  "ike.start_failed": "IKEv2 client failed to start; check the exit log",
+  "ike.already_running": "An IKEv2 client is already using this exit directory; stop the previous process before restarting",
+  "ike.load_failed": "Failed to load IKEv2 settings; check credentials and CA certificate",
+  "ike.xfrm_failed": "Failed to create an XFRM interface; Linux kernel XFRM support is required",
+  "ike.check_failed": "Failed to check IKEv2 status", "ike.connect_failed": "Failed to establish IKEv2; check server availability, credentials and certificate",
+  "ike.untrusted_server": "The IKEv2 server certificate failed verification: it is not issued for the remote ID or does not chain to a trusted CA. Check the remote ID; if the server does not send its full chain, set the server's CA certificate in the exit settings",
+});
+Object.assign(I18N.zh, {
+  "ike.host": "IKEv2 服务器", "ike.remote_id": "远程 ID（留空使用服务器名称）",
+  "ike.local_id": "本地 ID（留空使用用户名）", "ike.ca": "公司 CA 证书（PEM，可选）",
+  "ike.cert_hint": "未指定 CA 时使用面板镜像的受信任证书。始终验证服务器身份。",
+  "ike.sites_hint": "公司网站必须能通过客户端的常规 DNS 解析：不会通过 IKEv2 解析公司内部名称。在下方添加所选网站域名，其他网站保持当前路由。",
+  "ike.connected": "IKEv2 会话已建立", "ike.invalid": "无效的 IKEv2 字段：{field}",
+  "ike.start_failed": "IKEv2 客户端启动失败，请检查出口日志",
+  "ike.already_running": "已有 IKEv2 客户端正在使用此出口目录，请先停止旧进程再重启",
+  "ike.load_failed": "无法加载 IKEv2 设置，请检查凭据和 CA 证书",
+  "ike.xfrm_failed": "无法创建 XFRM 接口，需要 Linux 内核支持 XFRM",
+  "ike.check_failed": "无法检查 IKEv2 状态", "ike.connect_failed": "无法建立 IKEv2，请检查服务器、凭据和证书",
+  "ike.untrusted_server": "IKEv2 服务器证书验证失败：证书不是为远程 ID 签发的，或无法链接到受信任的 CA。请检查远程 ID；如果服务器未发送完整证书链，请在出口设置中填写服务器的 CA 证书",
+});
+Object.assign(I18N.fa, {
+  "ike.host": "سرور IKEv2", "ike.remote_id": "شناسهٔ راه‌دور (خالی: نام سرور)",
+  "ike.local_id": "شناسهٔ محلی (خالی: نام کاربری)", "ike.ca": "گواهی CA شرکت (PEM، اختیاری)",
+  "ike.cert_hint": "بدون CA اختصاصی، گواهی‌های معتبر تصویر پنل استفاده می‌شوند. هویت سرور همیشه بررسی می‌شود.",
+  "ike.sites_hint": "سایت‌های شرکت باید با DNS معمول کلاینت پیدا شوند: نام‌های داخلی شرکت از راه IKEv2 حل نمی‌شوند. دامنهٔ سایت‌های انتخابی را در پایین اضافه کنید؛ سایت‌های دیگر مسیر فعلی را حفظ می‌کنند.",
+  "ike.connected": "نشست IKEv2 برقرار است", "ike.invalid": "فیلد IKEv2 نامعتبر است: {field}",
+  "ike.start_failed": "کلاینت IKEv2 اجرا نشد؛ گزارش خروجی را بررسی کنید",
+  "ike.already_running": "یک کلاینت IKEv2 از پوشهٔ این خروجی استفاده می‌کند؛ پیش از راه‌اندازی دوباره، فرایند قبلی را متوقف کنید",
+  "ike.load_failed": "بارگذاری تنظیمات IKEv2 ناموفق بود؛ اطلاعات ورود و گواهی CA را بررسی کنید",
+  "ike.xfrm_failed": "ساخت رابط XFRM ناموفق بود؛ پشتیبانی XFRM در هستهٔ Linux لازم است",
+  "ike.check_failed": "بررسی وضعیت IKEv2 ناموفق بود", "ike.connect_failed": "اتصال IKEv2 برقرار نشد؛ سرور، اطلاعات ورود و گواهی را بررسی کنید",
+  "ike.untrusted_server": "گواهی سرور IKEv2 تأیید نشد: برای شناسهٔ راه‌دور صادر نشده یا به یک CA معتبر نمی‌رسد. شناسهٔ راه‌دور را بررسی کنید؛ اگر سرور زنجیرهٔ کامل را نمی‌فرستد، گواهی CA سرور را در تنظیمات خروجی وارد کنید",
+});
+
 /* Разделители: перечисление, фразы, ссылки */
 const SEP = {
   list: { zh: "、", fa: "، " }, phrase: { zh: "，", fa: "، " }, refs: { zh: "；", fa: "؛ " },

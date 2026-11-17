@@ -1,5 +1,6 @@
-"""Туннели к выходам (AmneziaWG — awgrN, SOCKS5 — hev-socks5-tunnel): запуск и остановка, движок
-выходов (модуль ядра или amneziawg-go), их живость по рукопожатиям, повторный разбор имён, счётчики трафика и квоты."""
+"""Туннели к выходам (AmneziaWG — awgrN, SOCKS5 — hev-socks5-tunnel, IKEv2 — XFRM awgrN и свой charon): запуск и
+остановка, движок выходов (модуль ядра или amneziawg-go), их живость по рукопожатиям, повторный разбор имён, счётчики
+трафика и квоты."""
 from __future__ import annotations
 
 import ipaddress
@@ -10,7 +11,7 @@ import subprocess
 import threading
 import time
 
-from .. import awgconf, config, cps, limits, nftgen, socks, system
+from .. import awgconf, config, cps, ikev2, limits, nftgen, socks, system
 from ..i18n import Msg, msg_of
 from ..store import Store
 from ..traffic import month_key
@@ -26,7 +27,11 @@ AWG31_KEYS = re.compile(r"^\s*(HeaderProtectionKey|ContentPaddingAddition|Random
 SERVER_ENGINE_EVERY = 60     # с: как часто заново смотреть, чем работает интерфейс сервера
 FLAP_SECS = 60                          # туннель упал раньше — считаем неудачным запуском
 CONNECTING_SECS = 30     # с после запуска выхода без ответа: «подключается» — его клиенты в блоке, а не на резерве
-HANDSHAKE_POLL = 0.5     # с: как часто смотреть, ответил ли только что запущенный выход AWG
+HANDSHAKE_POLL = 0.5     # с: как часто смотреть, ответил ли только что запущенный выход AWG или IKEv2
+# с без установленного CHILD_SA: дальше выход IKEv2 перезапускается с общей паузой (UP_PAUSES). Отказ начальной
+# аутентификации не создаёт SA, и DPD charon такой сеанс сам не восстановит
+IKE_RESTART_AFTER = 120
+IKE_DOWN = {"healthy": False, "address": "", "rx": 0, "tx": 0}     # ответ «нет сессии» в виде ikev2.parse_status
 
 
 class TunnelsMixin:
@@ -44,6 +49,8 @@ class TunnelsMixin:
         r = self.rt.pop(uid, None)
         if not r:
             return
+        if r.ike:
+            r.ike.close()           # сам останавливает charon и убирает только свои SA и политики XFRM
         if r.proc and r.proc.poll() is None:
             r.proc.terminate()
             try:
@@ -67,7 +74,14 @@ class TunnelsMixin:
                   conf_hash: str) -> None:
         r = UpRT(u["num"], conf_hash, t.key)
         ifn = r.iface
+        if pc.kind == "ikev2" and not config.DRY_RUN:
+            r.ike = ikev2.Runtime(os.path.join(RUN_DIR, f"ike-{r.num}"), ifn, os.path.join(LOG_DIR, f"{ifn}.log"))
+            r.ike.check_owner()        # чужой активный выход нельзя затронуть даже до запуска charon
         t.ns(["ip", "link", "del", ifn], check=False)
+        if pc.kind == "ikev2":
+            self.rt[uid] = r           # при ошибке запуска _stop_up закроет уже созданное
+            self._start_ike(t, r, u, pc)
+            return
         if pc.kind == "socks5":
             self._start_socks(t, r, u, pc)
             self.rt[uid] = r
@@ -79,19 +93,7 @@ class TunnelsMixin:
             return
         setconf = pc.setconf
         if not config.DRY_RUN:
-            # имя из Endpoint разбираем здесь, в сети панели, до создания интерфейса: в сети
-            # контейнера Amnezia свой резолвер не работает (127.0.0.53 от systemd-resolved)
-            host = awgconf.split_endpoint(pc.endpoint)[0]
-            if host in getattr(self, "_pre_failed", ()):       # уже ждали его в _prefetch_hosts
-                raise system.SysError(Msg("cfg.endpoint_resolve", host=host))
-            ip = getattr(self, "_pre", {}).get(host)
-            if ip is None:
-                try:
-                    ip = awgconf.resolve_host(host)
-                except awgconf.ConfigError as e:
-                    raise system.SysError(e.msg) from None
-            self._v6_route(t, ip)
-            setconf = awgconf.setconf_for(pc, ip)
+            setconf = awgconf.setconf_for(pc, self._endpoint_ip(t, pc))
         r.engine = self.exit_engine()
         kernel_err = None       # awg setconf на модуле не прошёл: ошибка модуля или самого конфига
         if r.engine == "kernel":
@@ -205,11 +207,11 @@ class TunnelsMixin:
                 and self.server_engine is None and not getattr(self, "_srv_iface", True)
                 and self.module_info()["ok"])
 
-    def _prefetch_hosts(self, wanted: dict, now: float) -> None:
-        """Имена из Endpoint выходов AWG, которые этот проход будет запускать, разбираются разом
-        (`awgconf.resolve_many`): по очереди каждое неразрешимое имя держало бы проход — а с ним блокировку
-        движка, выдачу конфигов и личные страницы клиентов — по RESOLVE_TIMEOUT секунд. Одно имя разбирает
-        сам `_start_up`, как раньше."""
+    def _prefetch_hosts(self, wanted: dict, now: float, awg: bool = True) -> None:
+        """Имена выходов, которые этот проход будет запускать, разбираются разом (`awgconf.resolve_many`): по
+        очереди каждое неразрешимое имя держало бы проход — а с ним блокировку движка, выдачу конфигов и личные
+        страницы клиентов — по RESOLVE_TIMEOUT секунд. Одно имя разбирает сам `_start_up`, как раньше.
+        awg — запускаются ли в этом проходе выходы AWG (нет, пока они ждут интерфейс сервера: engine_pending)."""
         self._pre, self._pre_failed = {}, set()
         if config.DRY_RUN:
             return
@@ -221,6 +223,8 @@ class TunnelsMixin:
             try:
                 pc = self.parsed(u)
             except awgconf.ConfigError:
+                continue
+            if pc.kind == "awg" and not awg:
                 continue
             # имя прокси SOCKS5 тоже: socks.resolve в _start_socks иначе разбирал бы его отдельно
             host = pc.socks["host"] if pc.kind == "socks5" else awgconf.split_endpoint(pc.endpoint)[0]
@@ -266,6 +270,42 @@ class TunnelsMixin:
         if p.returncode != 0:
             raise system.SysError(Msg("sys.no_v6_container" if t.kind == "container" else "sys.no_v6_route",
                                       ip=ip))
+
+    def _endpoint_ip(self, t: system.Target, pc: awgconf.UpstreamConf) -> str:
+        """Адрес сервера выхода из его Endpoint. Имя разбирается здесь, в сети панели, до создания интерфейса: в
+        сети контейнера Amnezia свой резолвер не работает (127.0.0.53 от systemd-resolved). Имя из общего разбора
+        (_prefetch_hosts) второй раз не разбирается. Путь IPv6 проверяется сразу, чтобы выход без маршрута
+        сообщил причину, а не висел «без связи»."""
+        host = awgconf.split_endpoint(pc.endpoint)[0]
+        if host in getattr(self, "_pre_failed", ()):       # уже ждали его в _prefetch_hosts
+            raise system.SysError(Msg("cfg.endpoint_resolve", host=host))
+        ip = getattr(self, "_pre", {}).get(host)
+        if ip is None:
+            try:
+                ip = awgconf.resolve_host(host)
+            except awgconf.ConfigError as e:
+                raise system.SysError(e.msg) from None
+        self._v6_route(t, ip)
+        return ip
+
+    def _start_ike(self, t: system.Target, r: UpRT, u: dict, pc: awgconf.UpstreamConf) -> None:
+        """Выход IKEv2: XFRM-интерфейс awgrN с собственным if_id и свой charon. XFRM сохраняет модель интерфейсов
+        выходов (метка → таблица → awgrN) и отделяет политики IPsec этого выхода от остальной сети сервера."""
+        if not config.DRY_RUN:
+            # адрес сервера нужен до изменения сети: при неразрешимом имени или без пути IPv6 интерфейс не создаём
+            ip = self._endpoint_ip(t, pc)
+            try:
+                t.ns(["ip", "link", "add", r.iface, "type", "xfrm", "if_id", str(ikev2.XFRM_ID_BASE + r.num)])
+            except system.SysError:
+                raise system.SysError(Msg("ike.xfrm_failed")) from None
+        # служебный адрес, как у остальных выходов: без IPv4 rp_filter отбросил бы входящие пакеты интерфейса
+        t.ns(["ip", "addr", "replace", f"169.254.200.{r.num}/32", "dev", r.iface])
+        t.ns(["ip", "link", "set", r.iface, "mtu", str(pc.mtu), "up"])
+        t.ns(["sysctl", "-qw", f"net.ipv4.conf.{r.iface}.rp_filter=2"], check=False)
+        if not config.DRY_RUN:
+            r.ike.start(t, pc.ikev2, ip)
+            r.proc = r.ike.proc
+        self.event("info", Msg("ev.tunnel_up", iface=r.iface, name=u["name"], endpoint=pc.endpoint))
 
     def _start_socks(self, t: system.Target, r: UpRT, u: dict, pc: awgconf.UpstreamConf) -> None:
         """hev-socks5-tunnel в сети сервера: создаёт TUN awgrN и отправляет всё из него в прокси."""
@@ -344,10 +384,8 @@ class TunnelsMixin:
         now = time.time()
         eng = self.exit_engine()
         wait_engine = self.engine_pending()
-        if wait_engine:
-            self._pre, self._pre_failed = {}, set()     # выходы AWG ждут сервер: разбирать имена незачем
-        else:
-            self._prefetch_hosts(wanted, now)
+        # выходы AWG ждут сервер, и их имена разбирать незачем; SOCKS5 и IKEv2 от него не зависят и запускаются
+        self._prefetch_hosts(wanted, now, awg=not wait_engine)
         for uid, u in wanted.items():
             try:
                 pc = self.parsed(u)
@@ -415,7 +453,8 @@ class TunnelsMixin:
                     kinds.add(self.parsed(u).kind)
                 except Exception:  # noqa: BLE001
                     kinds.add("awg")
-        awg_on, socks_on = len(kinds - {"socks5"}) > 0, "socks5" in kinds
+        # XFRM-интерфейсов IKEv2 в `awg show` нет: только IKEv2 — без этого вызова
+        awg_on, socks_on = "awg" in kinds, "socks5" in kinds
         dumps = links = None
         if awg_on:
             p = t.ns(["awg", "show", "all", "dump"], check=False, timeout=10)
@@ -448,6 +487,9 @@ class TunnelsMixin:
                 kind = "awg"
             if kind == "socks5":
                 self._socks_health(t, u, r, now, links)
+                continue
+            if kind == "ikev2":
+                self._ike_health(u, r, now)
                 continue
             if config.DRY_RUN and self._fake and r.iface not in self._fake.handshakes:
                 # в демо второй туннель «мёртвый», чтобы было видно резервирование
@@ -493,7 +535,7 @@ class TunnelsMixin:
                 log.info("connecting exits: %s", e)
 
     def _connecting_due(self, t: system.Target | None, now: float) -> bool:
-        """Есть ли «подключающийся» выход AWG, который уже ответил или чей срок вышел (нужен проход)."""
+        """Есть ли «подключающийся» выход AWG или IKEv2, который уже ответил или чей срок вышел (нужен проход)."""
         if t is None:
             return False
         for uid, r in list(self.rt.items()):
@@ -502,6 +544,14 @@ class TunnelsMixin:
                 continue                    # SOCKS5 будит проход сам (проверка прокси); since — тот же запуск
             if now - r.started >= CONNECTING_SECS:
                 return True
+            if h.get("kind") == "ikev2":
+                # у IKEv2 нет рукопожатия AWG: ответил — значит, charon установил CHILD_SA
+                try:
+                    if r.ike and r.ike.status()["healthy"]:
+                        return True
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    log.info("ikev2 status %s: %s", r.iface, e)
+                continue
             p = t.ns(["awg", "show", r.iface, "latest-handshakes"], check=False, timeout=5)
             for line in (p.stdout or "").splitlines():
                 parts = line.split()
@@ -548,6 +598,38 @@ class TunnelsMixin:
             finally:
                 self._rr_busy.discard(uid)
         threading.Thread(target=run, name=f"reresolve-{uid}", daemon=True).start()
+
+    def _ike_health(self, u: dict, r: UpRT, now: float) -> None:
+        """Выход IKEv2 работает, пока charon держит установленный CHILD_SA с виртуальным IPv4: с ним вместе меняются
+        готовность выхода и его адрес SNAT (_up_list). Без SA дольше IKE_RESTART_AFTER — перезапуск с паузой."""
+        uid = u["id"]
+        error = None
+        try:
+            if r.ike is None:           # демо (DRY_RUN): charon не запускается, выход «подключён»
+                status = {**IKE_DOWN, "healthy": True, "address": "10.250.0.2"}
+            else:
+                status = r.ike.status()
+        except (OSError, subprocess.TimeoutExpired):
+            status, error = IKE_DOWN, Msg("ike.check_failed")
+        healthy = status["healthy"]
+        # причина из журнала charon видна сразу, а не только после остановки попыток через IKE_RESTART_AFTER
+        reason = r.ike.failure() if not healthy and r.ike else None
+        error = error or reason
+        prev = self.health.get(uid, {}).get("healthy")
+        if prev is not None and prev != healthy:
+            self.event("info" if healthy else "warn",
+                       Msg("ev.upstream_ok" if healthy else "ev.upstream_failed", name=u["name"], uid=uid))
+        r.ike_address = status["address"]
+        if healthy:
+            r.ike_down_since = now
+        connecting = not healthy and now - r.started < CONNECTING_SECS
+        self.health[uid] = {"state": "up" if healthy else ("connecting" if connecting else "stale"),
+                            "healthy": healthy, "kind": "ikev2", "iface": r.iface,
+                            "endpoint": self.parsed(u).endpoint, "address": r.ike_address, "since": r.started,
+                            "rx": status["rx"], "tx": status["tx"], "error": error}
+        if not healthy and now - r.ike_down_since >= IKE_RESTART_AFTER:
+            self._stop_up(uid)
+            self._failed_up(uid, f"{r.conf_hash}|{r.target_key}", reason or Msg("ike.connect_failed"), u)
 
     def _socks_health(self, t: system.Target, u: dict, r: UpRT, now: float, links: dict | None = None) -> None:
         """Выход SOCKS5 работает, если жив hev-socks5-tunnel и недавняя проверка прокси прошла.
